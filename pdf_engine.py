@@ -7,7 +7,7 @@ from typing import Any
 import barcode
 import fitz
 from barcode.writer import ImageWriter
-from PIL import Image
+from PIL import Image, ImageChops, ImageDraw
 
 from nest import LABEL_HEIGHT_MM, ORDER_PADDING_MM
 from storage import BASE_DIR, OUTPUT_DIR
@@ -21,10 +21,7 @@ def mm(value: float) -> float:
 
 
 def render_pdf_preview(pdf_path: Path, zoom: float = 2.0) -> bytes:
-    """Renderiza somente o desenho do PDF sobre fundo transparente.
-
-    Assim o CutContour pode ficar visualmente por cima da arte no editor web.
-    """
+    """Renderiza o CutContour sobre fundo transparente para o editor web."""
     doc = fitz.open(pdf_path)
     try:
         page = doc[0]
@@ -50,8 +47,76 @@ def _barcode_png(value: str) -> bytes:
     return stream.getvalue()
 
 
+def _sample_cubic(p0: fitz.Point, p1: fitz.Point, p2: fitz.Point, p3: fitz.Point, steps: int = 48) -> list[tuple[float, float]]:
+    points: list[tuple[float, float]] = []
+    for index in range(steps + 1):
+        t = index / steps
+        u = 1.0 - t
+        x = u**3 * p0.x + 3 * u * u * t * p1.x + 3 * u * t * t * p2.x + t**3 * p3.x
+        y = u**3 * p0.y + 3 * u * u * t * p1.y + 3 * u * t * t * p2.y + t**3 * p3.y
+        points.append((x, y))
+    return points
+
+
+def _cut_contour_mask(template_path: Path, canvas_w: int, canvas_h: int) -> Image.Image:
+    """Cria uma máscara raster preenchida usando o próprio vetor CutContour.
+
+    A máscara não altera o PDF vetorial de corte: ela serve apenas para impedir que
+    a tinta da arte seja impressa fora da área demarcada pelo contorno.
+    """
+    doc = fitz.open(template_path)
+    try:
+        page = doc[0]
+        drawings = page.get_drawings()
+        if not drawings:
+            raise ValueError(f"O modelo {template_path.name} não possui um contorno vetorial utilizável.")
+
+        # Nos presets Roland o CutContour é o desenho principal. Usamos o maior
+        # contorno para ignorar eventuais pequenos objetos auxiliares no futuro.
+        outline = max(drawings, key=lambda drawing: drawing["rect"].width * drawing["rect"].height)
+        points: list[tuple[float, float]] = []
+
+        for item in outline["items"]:
+            op = item[0]
+            if op == "l":
+                p0, p1 = item[1], item[2]
+                if not points:
+                    points.append((p0.x, p0.y))
+                points.append((p1.x, p1.y))
+            elif op == "c":
+                p0, p1, p2, p3 = item[1], item[2], item[3], item[4]
+                sampled = _sample_cubic(p0, p1, p2, p3)
+                if points:
+                    sampled = sampled[1:]
+                points.extend(sampled)
+            elif op == "re":
+                rect = item[1]
+                points.extend(
+                    [
+                        (rect.x0, rect.y0),
+                        (rect.x1, rect.y0),
+                        (rect.x1, rect.y1),
+                        (rect.x0, rect.y1),
+                    ]
+                )
+
+        if len(points) < 3:
+            raise ValueError(f"Não foi possível reconstruir a área interna do CutContour de {template_path.name}.")
+
+        scale_x = canvas_w / page.rect.width
+        scale_y = canvas_h / page.rect.height
+        polygon = [(round(x * scale_x), round(y * scale_y)) for x, y in points]
+
+        mask = Image.new("L", (canvas_w, canvas_h), 0)
+        ImageDraw.Draw(mask).polygon(polygon, fill=255)
+        return mask
+    finally:
+        doc.close()
+
+
 def _piece_art_png(
     image_path: Path,
+    template_path: Path,
     piece_w_mm: float,
     piece_h_mm: float,
     scale: float,
@@ -59,7 +124,7 @@ def _piece_art_png(
     offset_y_mm: float,
     rotation: int = 0,
 ) -> bytes:
-    """Gera a arte raster já recortada na caixa da peça."""
+    """Monta a arte e elimina tudo que estiver fora do CutContour."""
     px_per_mm = ART_DPI / 25.4
     canvas_w = max(1, round(piece_w_mm * px_per_mm))
     canvas_h = max(1, round(piece_h_mm * px_per_mm))
@@ -81,6 +146,11 @@ def _piece_art_png(
         x = (canvas_w - art.width) // 2 + ox
         y = (canvas_h - art.height) // 2 + oy
         canvas.alpha_composite(art, (x, y))
+
+        # A tinta só permanece na região interna delimitada pelo CutContour.
+        cut_mask = _cut_contour_mask(template_path, canvas_w, canvas_h)
+        alpha = canvas.getchannel("A")
+        canvas.putalpha(ImageChops.multiply(alpha, cut_mask))
 
         stream = io.BytesIO()
         canvas.save(stream, format="PNG", dpi=(ART_DPI, ART_DPI))
@@ -108,6 +178,7 @@ def build_order_pdf(order: dict[str, Any], model: dict[str, Any], block: Any) ->
 
     art_png = _piece_art_png(
         image_path=image_path,
+        template_path=template_path,
         piece_w_mm=piece_w,
         piece_h_mm=piece_h,
         scale=float(order.get("art_scale", 1.0)),
@@ -125,7 +196,7 @@ def build_order_pdf(order: dict[str, Any], model: dict[str, Any], block: Any) ->
             rect = fitz.Rect(mm(x_mm), mm(y_mm), mm(x_mm + piece_w), mm(y_mm + piece_h))
 
             page.insert_image(rect, stream=art_png, keep_proportion=False)
-            # O PDF vetorial CutContour sempre entra por cima da arte.
+            # O PDF vetorial CutContour entra por cima e continua sendo a linha real de corte.
             page.show_pdf_page(rect, template_doc, 0, keep_proportion=False, overlay=True)
 
         border = fitz.Rect(mm(0.25), mm(0.25), width_pt - mm(0.25), height_pt - mm(0.25))
