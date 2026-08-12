@@ -13,6 +13,7 @@ from nest import LABEL_HEIGHT_MM, ORDER_PADDING_MM
 from storage import BASE_DIR, OUTPUT_DIR
 
 MM_TO_PT = 72.0 / 25.4
+ART_DPI = 300
 
 
 def mm(value: float) -> float:
@@ -21,9 +22,12 @@ def mm(value: float) -> float:
 
 def render_pdf_preview(pdf_path: Path, zoom: float = 2.0) -> bytes:
     doc = fitz.open(pdf_path)
-    page = doc[0]
-    pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
-    return pix.tobytes("png")
+    try:
+        page = doc[0]
+        pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
+        return pix.tobytes("png")
+    finally:
+        doc.close()
 
 
 def _barcode_png(value: str) -> bytes:
@@ -42,22 +46,45 @@ def _barcode_png(value: str) -> bytes:
     return stream.getvalue()
 
 
-def _insert_art(page: fitz.Page, rect: fitz.Rect, image_path: Path, scale: float, offset_x_mm: float, offset_y_mm: float, rotation: int = 0) -> None:
-    with Image.open(image_path) as img:
-        iw, ih = img.size
-    if iw <= 0 or ih <= 0:
-        return
+def _piece_art_png(
+    image_path: Path,
+    piece_w_mm: float,
+    piece_h_mm: float,
+    scale: float,
+    offset_x_mm: float,
+    offset_y_mm: float,
+    rotation: int = 0,
+) -> bytes:
+    """Gera a arte raster já recortada na caixa da peça.
 
-    target_w = rect.width * scale
-    target_h = target_w * ih / iw
-    if target_h < rect.height * scale:
-        target_h = rect.height * scale
-        target_w = target_h * iw / ih
+    Isso mantém o bleed dentro do retângulo da peça e impede que zoom/deslocamento
+    invada a peça vizinha. O PDF de corte vetorial é sobreposto depois.
+    """
+    px_per_mm = ART_DPI / 25.4
+    canvas_w = max(1, round(piece_w_mm * px_per_mm))
+    canvas_h = max(1, round(piece_h_mm * px_per_mm))
 
-    cx = (rect.x0 + rect.x1) / 2 + mm(offset_x_mm)
-    cy = (rect.y0 + rect.y1) / 2 + mm(offset_y_mm)
-    art_rect = fitz.Rect(cx - target_w / 2, cy - target_h / 2, cx + target_w / 2, cy + target_h / 2)
-    page.insert_image(art_rect, filename=str(image_path), keep_proportion=True, rotate=rotation)
+    with Image.open(image_path) as original:
+        art = original.convert("RGBA")
+        if rotation % 360:
+            art = art.rotate(-rotation, expand=True, resample=Image.Resampling.BICUBIC)
+
+        iw, ih = art.size
+        cover = max(canvas_w / iw, canvas_h / ih)
+        resize_factor = cover * max(0.1, scale)
+        new_size = (max(1, round(iw * resize_factor)), max(1, round(ih * resize_factor)))
+        art = art.resize(new_size, Image.Resampling.LANCZOS)
+
+        canvas = Image.new("RGBA", (canvas_w, canvas_h), (255, 255, 255, 0))
+        ox = round(offset_x_mm * px_per_mm)
+        oy = round(offset_y_mm * px_per_mm)
+        x = (canvas_w - art.width) // 2 + ox
+        y = (canvas_h - art.height) // 2 + oy
+        canvas.alpha_composite(art, (x, y))
+
+        stream = io.BytesIO()
+        canvas.save(stream, format="PNG", dpi=(ART_DPI, ART_DPI))
+        return stream.getvalue()
 
 
 def build_order_pdf(order: dict[str, Any], model: dict[str, Any], block: Any) -> Path:
@@ -70,8 +97,7 @@ def build_order_pdf(order: dict[str, Any], model: dict[str, Any], block: Any) ->
     page = doc.new_page(width=width_pt, height=height_pt)
 
     pad = ORDER_PADDING_MM
-    label_h = LABEL_HEIGHT_MM
-    grid_top_mm = pad + label_h
+    grid_top_mm = pad + LABEL_HEIGHT_MM
     piece_w = block.piece_width_mm
     piece_h = block.piece_height_mm
     spacing = 2.0
@@ -80,41 +106,45 @@ def build_order_pdf(order: dict[str, Any], model: dict[str, Any], block: Any) ->
     template_path = BASE_DIR / model["pdf_path"]
     template_doc = fitz.open(template_path)
 
-    for index in range(block.quantity):
-        row = index // block.cols
-        col = index % block.cols
-        x_mm = pad + col * (piece_w + spacing)
-        y_mm = grid_top_mm + row * (piece_h + spacing)
-        rect = fitz.Rect(mm(x_mm), mm(y_mm), mm(x_mm + piece_w), mm(y_mm + piece_h))
+    art_png = _piece_art_png(
+        image_path=image_path,
+        piece_w_mm=piece_w,
+        piece_h_mm=piece_h,
+        scale=float(order.get("art_scale", 1.0)),
+        offset_x_mm=float(order.get("offset_x_mm", 0.0)),
+        offset_y_mm=float(order.get("offset_y_mm", 0.0)),
+        rotation=int(order.get("art_rotation", 0)),
+    )
 
-        _insert_art(
-            page,
-            rect,
-            image_path,
-            float(order.get("art_scale", 1.0)),
-            float(order.get("offset_x_mm", 0.0)),
-            float(order.get("offset_y_mm", 0.0)),
-            int(order.get("art_rotation", 0)),
-        )
-        page.show_pdf_page(rect, template_doc, 0, keep_proportion=False, overlay=True)
+    try:
+        for index in range(block.quantity):
+            row = index // block.cols
+            col = index % block.cols
+            x_mm = pad + col * (piece_w + spacing)
+            y_mm = grid_top_mm + row * (piece_h + spacing)
+            rect = fitz.Rect(mm(x_mm), mm(y_mm), mm(x_mm + piece_w), mm(y_mm + piece_h))
 
-    border = fitz.Rect(mm(0.25), mm(0.25), width_pt - mm(0.25), height_pt - mm(0.25))
-    page.draw_rect(border, width=0.25)
+            page.insert_image(rect, stream=art_png, keep_proportion=False)
+            page.show_pdf_page(rect, template_doc, 0, keep_proportion=False, overlay=True)
 
-    info = f"PED {order['code']} | {model['name']} | QTD {order['quantity']}"
-    details = (order.get("details") or "").strip()
-    if details:
-        info += f" | {details}"
-    page.insert_text((mm(pad), mm(4.0)), info[:140], fontsize=5.5)
+        border = fitz.Rect(mm(0.25), mm(0.25), width_pt - mm(0.25), height_pt - mm(0.25))
+        page.draw_rect(border, width=0.25)
 
-    barcode_bytes = _barcode_png(str(order["code"]))
-    barcode_rect = fitz.Rect(width_pt - mm(38), mm(1.0), width_pt - mm(2), mm(8.5))
-    page.insert_image(barcode_rect, stream=barcode_bytes, keep_proportion=True)
-    page.insert_text((width_pt - mm(37), mm(9.4)), str(order["code"]), fontsize=4.5)
+        info = f"PED {order['code']} | {model['name']} | QTD {order['quantity']}"
+        details = (order.get("details") or "").strip()
+        if details:
+            info += f" | {details}"
+        page.insert_text((mm(pad), mm(4.0)), info[:140], fontsize=5.5)
 
-    doc.save(out, garbage=4, deflate=True)
-    doc.close()
-    template_doc.close()
+        barcode_bytes = _barcode_png(str(order["code"]))
+        barcode_rect = fitz.Rect(width_pt - mm(38), mm(1.0), width_pt - mm(2), mm(8.2))
+        page.insert_image(barcode_rect, stream=barcode_bytes, keep_proportion=True)
+        page.insert_text((width_pt - mm(37), mm(9.3)), str(order["code"]), fontsize=4.5)
+
+        doc.save(out, garbage=4, deflate=True)
+    finally:
+        template_doc.close()
+        doc.close()
     return out
 
 
