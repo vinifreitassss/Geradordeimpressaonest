@@ -11,8 +11,6 @@ SHEET_MAX_HEIGHT_MM = 600.0
 PIECE_SPACING_MM = 2.0
 LABEL_HEIGHT_MM = 10.0
 ORDER_PADDING_MM = 2.0
-# Pedidos que não cabem inteiros são quebrados em blocos horizontais de até 3 linhas.
-# Isso dá flexibilidade ao nest para preencher a mesma folha com outros pedidos.
 LARGE_ORDER_FRAGMENT_ROWS = 3
 
 
@@ -33,7 +31,8 @@ class OrderBlock:
 
 def _block_dimensions(quantity: int, piece_w: float, piece_h: float, cols: int) -> tuple[float, float, int]:
     rows = math.ceil(quantity / cols)
-    grid_w = min(quantity, cols) * piece_w + max(0, min(quantity, cols) - 1) * PIECE_SPACING_MM
+    used_cols = min(quantity, cols)
+    grid_w = used_cols * piece_w + max(0, used_cols - 1) * PIECE_SPACING_MM
     grid_h = rows * piece_h + max(0, rows - 1) * PIECE_SPACING_MM
     return (
         grid_w + 2 * ORDER_PADDING_MM,
@@ -43,12 +42,6 @@ def _block_dimensions(quantity: int, piece_w: float, piece_h: float, cols: int) 
 
 
 def _horizontal_layout(quantity: int, model: dict[str, Any], max_rows: int | None = None) -> tuple[int, int, float, float, float, float] | None:
-    """Escolhe a montagem mais horizontal possível.
-
-    A largura de 450 mm é a referência fixa da impressora. Por isso priorizamos
-    mais colunas e menor altura, em vez de procurar o retângulo de menor área.
-    A peça em si pode ser girada 90 graus quando isso permitir uma grade melhor.
-    """
     orientations = [
         (float(model["width_mm"]), float(model["height_mm"])),
         (float(model["height_mm"]), float(model["width_mm"])),
@@ -63,13 +56,10 @@ def _horizontal_layout(quantity: int, model: dict[str, Any], max_rows: int | Non
         seen.add(key)
         max_cols = max(1, int((SHEET_WIDTH_MM - 2 * ORDER_PADDING_MM + PIECE_SPACING_MM) // (piece_w + PIECE_SPACING_MM)))
         cols = min(quantity, max_cols)
-        if cols < 1:
-            continue
         block_w, block_h, rows = _block_dimensions(quantity, piece_w, piece_h, cols)
         if max_rows is not None and rows > max_rows:
             continue
         if block_w <= SHEET_WIDTH_MM + 1e-6 and block_h <= SHEET_MAX_HEIGHT_MM + 1e-6:
-            # Menor altura primeiro; empate: maior largura/mais colunas.
             candidates.append((block_h, -block_w, -cols, cols, rows, piece_w, piece_h))
 
     if not candidates:
@@ -80,16 +70,10 @@ def _horizontal_layout(quantity: int, model: dict[str, Any], max_rows: int | Non
     return cols, rows, piece_w, piece_h, block_w, block_h
 
 
-def choose_order_block(order: dict[str, Any], model: dict[str, Any], quantity: int | None = None, block_id: str | None = None) -> OrderBlock:
-    qty = int(quantity if quantity is not None else order["quantity"])
-    layout = _horizontal_layout(qty, model)
-    if layout is None:
-        raise ValueError(
-            f"Pedido {order['code']} não cabe em uma folha de {SHEET_WIDTH_MM:.0f}x{SHEET_MAX_HEIGHT_MM:.0f} mm como bloco único."
-        )
+def _make_block(order: dict[str, Any], qty: int, layout: tuple[int, int, float, float, float, float], block_id: str) -> OrderBlock:
     cols, rows, piece_w, piece_h, block_w, block_h = layout
     return OrderBlock(
-        block_id=block_id or order["id"],
+        block_id=block_id,
         order_id=order["id"],
         width_mm=block_w,
         height_mm=block_h,
@@ -101,60 +85,54 @@ def choose_order_block(order: dict[str, Any], model: dict[str, Any], quantity: i
     )
 
 
-def split_order_blocks(order: dict[str, Any], model: dict[str, Any]) -> list[OrderBlock]:
-    """Mantém pedidos pequenos inteiros e fragmenta automaticamente os grandes.
+def choose_order_block(order: dict[str, Any], model: dict[str, Any], quantity: int | None = None, block_id: str | None = None) -> OrderBlock:
+    qty = int(quantity if quantity is not None else order["quantity"])
+    layout = _horizontal_layout(qty, model)
+    if layout is None:
+        raise ValueError(
+            f"Pedido {order['code']} não cabe em uma folha de {SHEET_WIDTH_MM:.0f}x{SHEET_MAX_HEIGHT_MM:.0f} mm como bloco único."
+        )
+    return _make_block(order, qty, layout, block_id or order["id"])
 
-    Fragmentos são deliberadamente horizontais e relativamente baixos para que
-    o MaxRects consiga misturá-los com pedidos menores na mesma folha.
-    """
+
+def split_order_blocks(order: dict[str, Any], model: dict[str, Any]) -> list[OrderBlock]:
     total_qty = int(order["quantity"])
     whole_layout = _horizontal_layout(total_qty, model)
     if whole_layout is not None:
-        return [choose_order_block(order, model)]
+        return [_make_block(order, total_qty, whole_layout, order["id"])]
 
-    # Descobre quantas peças cabem em um fragmento horizontal de até N linhas.
-    orientations = [
-        (float(model["width_mm"]), float(model["height_mm"])),
-        (float(model["height_mm"]), float(model["width_mm"])),
-    ]
-    fragment_candidates: list[tuple[int, float, float]] = []
-    seen: set[tuple[float, float]] = set()
-    for piece_w, piece_h in orientations:
-        key = (round(piece_w, 4), round(piece_h, 4))
-        if key in seen:
-            continue
-        seen.add(key)
-        max_cols = int((SHEET_WIDTH_MM - 2 * ORDER_PADDING_MM + PIECE_SPACING_MM) // (piece_w + PIECE_SPACING_MM))
-        if max_cols < 1:
-            continue
-        max_rows_sheet = int((SHEET_MAX_HEIGHT_MM - LABEL_HEIGHT_MM - 2 * ORDER_PADDING_MM + PIECE_SPACING_MM) // (piece_h + PIECE_SPACING_MM))
-        rows = min(LARGE_ORDER_FRAGMENT_ROWS, max_rows_sheet)
-        if rows < 1:
-            continue
-        fragment_candidates.append((max_cols * rows, piece_w, piece_h))
+    # Procura a maior quantidade que caiba em um fragmento baixo/horizontal.
+    fragment_capacity = 0
+    max_probe = total_qty
+    for qty in range(1, max_probe + 1):
+        if _horizontal_layout(qty, model, max_rows=LARGE_ORDER_FRAGMENT_ROWS) is not None:
+            fragment_capacity = qty
+        else:
+            # depois que ultrapassa a capacidade das 3 linhas, quantidades maiores
+            # também não voltarão a caber neste limite.
+            if fragment_capacity:
+                break
 
-    if not fragment_candidates:
+    if fragment_capacity <= 0:
         raise ValueError(f"Pedido {order['code']}: a peça não cabe na área útil de 450x600 mm.")
 
-    # Prioriza maior capacidade por fragmento; o layout final continua horizontal.
-    fragment_candidates.sort(key=lambda x: x[0], reverse=True)
-    fragment_capacity = fragment_candidates[0][0]
     quantities = []
     remaining = total_qty
     while remaining > 0:
         q = min(fragment_capacity, remaining)
-        # Caso excepcional: diminui até achar uma montagem válida.
-        while q > 0 and _horizontal_layout(q, model, max_rows=LARGE_ORDER_FRAGMENT_ROWS) is None:
+        layout = _horizontal_layout(q, model, max_rows=LARGE_ORDER_FRAGMENT_ROWS)
+        while q > 0 and layout is None:
             q -= 1
-        if q <= 0:
+            layout = _horizontal_layout(q, model, max_rows=LARGE_ORDER_FRAGMENT_ROWS)
+        if q <= 0 or layout is None:
             raise ValueError(f"Pedido {order['code']}: não foi possível criar um bloco de produção válido.")
-        quantities.append(q)
+        quantities.append((q, layout))
         remaining -= q
 
     blocks: list[OrderBlock] = []
     part_total = len(quantities)
-    for idx, qty in enumerate(quantities, start=1):
-        block = choose_order_block(order, model, quantity=qty, block_id=f"{order['id']}__{idx:03d}")
+    for idx, (qty, layout) in enumerate(quantities, start=1):
+        block = _make_block(order, qty, layout, f"{order['id']}__{idx:03d}")
         block.part_index = idx
         block.part_total = part_total
         blocks.append(block)
@@ -170,9 +148,6 @@ def pack_order_blocks(blocks: list[OrderBlock]) -> list[dict[str, Any]]:
         mode=PackingMode.Offline,
         pack_algo=MaxRectsBssf,
         sort_algo=SORT_AREA,
-        # IMPORTANTE: o bloco do pedido não gira. A largura de 450 mm é fixa
-        # no sentido de alimentação da Roland. A rotação da peça é decidida
-        # internamente na montagem do bloco, nunca pelo nest externo.
         rotation=False,
     )
 
