@@ -1,0 +1,1 @@
+PDFs de corte predefinidos usados pelo aplicativo. Os arquivos mantêm a spot color CutContour.
