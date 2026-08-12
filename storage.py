@@ -15,25 +15,17 @@ UPLOADS_DIR = DATA_DIR / "uploads"
 ORDERS_DIR = DATA_DIR / "orders"
 OUTPUT_DIR = DATA_DIR / "output"
 MODELS_INDEX = DATA_DIR / "models.json"
+PRESETS_DIR = BASE_DIR / "presets"
 
 MM_PER_POINT = 25.4 / 72.0
 
-
-def ensure_dirs() -> None:
-    for path in (DATA_DIR, MODELS_DIR, UPLOADS_DIR, ORDERS_DIR, OUTPUT_DIR):
-        path.mkdir(parents=True, exist_ok=True)
-    if not MODELS_INDEX.exists():
-        MODELS_INDEX.write_text("[]", encoding="utf-8")
-
-
-def load_models() -> list[dict[str, Any]]:
-    ensure_dirs()
-    return json.loads(MODELS_INDEX.read_text(encoding="utf-8"))
-
-
-def save_models(models: list[dict[str, Any]]) -> None:
-    ensure_dirs()
-    MODELS_INDEX.write_text(json.dumps(models, ensure_ascii=False, indent=2), encoding="utf-8")
+BUILTIN_PRESETS = [
+    ("med5", "Medalha 5 cm", "linhacorte-med5cm.pdf"),
+    ("med6", "Medalha 6 cm", "linhacorte-med6cm.pdf"),
+    ("med7", "Medalha 7 cm", "linhacorte-med7cm.pdf"),
+    ("med8", "Medalha 8 cm", "linhacorte-med8cm.pdf"),
+    ("trf210_45", "TRF210 45 cm", "linhacorte-TRF210-45cm.pdf"),
+]
 
 
 def inspect_cut_pdf(pdf_source: Path) -> dict[str, Any]:
@@ -63,13 +55,69 @@ def inspect_cut_pdf(pdf_source: Path) -> dict[str, Any]:
         doc.close()
 
 
-def add_model(name: str, width_mm: float, height_mm: float, pdf_source: Path) -> dict[str, Any]:
-    """Cadastra um modelo.
+def _read_models_index() -> list[dict[str, Any]]:
+    try:
+        return json.loads(MODELS_INDEX.read_text(encoding="utf-8"))
+    except Exception:
+        return []
 
-    width_mm/height_mm são mantidos na assinatura por compatibilidade com a interface
-    atual, porém o tamanho usado pelo nest é sempre lido do PDF para impedir que a
-    linha de corte seja escalada acidentalmente.
-    """
+
+def _ensure_builtin_models() -> None:
+    models = _read_models_index()
+    by_id = {m.get("id"): m for m in models}
+    changed = False
+
+    for model_id, name, filename in BUILTIN_PRESETS:
+        path = PRESETS_DIR / filename
+        if not path.exists():
+            continue
+        info = inspect_cut_pdf(path)
+        model = {
+            "id": model_id,
+            "name": name,
+            "width_mm": info["width_mm"],
+            "height_mm": info["height_mm"],
+            "pdf_path": str(path.relative_to(BASE_DIR)),
+            "spacing_mm": 2.0,
+            "rotation_allowed": True,
+            "cut_contour": "CutContour",
+            "dimensions_source": "pdf_page",
+            "builtin": True,
+        }
+        if by_id.get(model_id) != model:
+            by_id[model_id] = model
+            changed = True
+
+    if changed:
+        ordered = []
+        builtin_ids = {x[0] for x in BUILTIN_PRESETS}
+        for model_id, _, _ in BUILTIN_PRESETS:
+            if model_id in by_id:
+                ordered.append(by_id[model_id])
+        ordered.extend(m for m in models if m.get("id") not in builtin_ids)
+        MODELS_INDEX.write_text(json.dumps(ordered, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def ensure_dirs() -> None:
+    for path in (DATA_DIR, MODELS_DIR, UPLOADS_DIR, ORDERS_DIR, OUTPUT_DIR):
+        path.mkdir(parents=True, exist_ok=True)
+    if not MODELS_INDEX.exists():
+        MODELS_INDEX.write_text("[]", encoding="utf-8")
+    _ensure_builtin_models()
+
+
+def load_models() -> list[dict[str, Any]]:
+    ensure_dirs()
+    return _read_models_index()
+
+
+def save_models(models: list[dict[str, Any]]) -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    MODELS_INDEX.write_text(json.dumps(models, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def add_model(name: str, width_mm: float, height_mm: float, pdf_source: Path) -> dict[str, Any]:
+    """Cadastra um modelo adicional; dimensões são sempre lidas do PDF."""
     info = inspect_cut_pdf(pdf_source)
     models = load_models()
     model_id = uuid.uuid4().hex[:10]
@@ -85,6 +133,7 @@ def add_model(name: str, width_mm: float, height_mm: float, pdf_source: Path) ->
         "rotation_allowed": True,
         "cut_contour": "CutContour",
         "dimensions_source": "pdf_page",
+        "builtin": False,
     }
     models.append(model)
     save_models(models)
