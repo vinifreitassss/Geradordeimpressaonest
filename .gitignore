@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+data/models/*.pdf
+data/uploads/*
+data/orders/*.json
+data/output/*.pdf
+!data/models/.gitkeep
+!data/uploads/.gitkeep
+!data/orders/.gitkeep
+!data/output/.gitkeep
