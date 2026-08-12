@@ -6,6 +6,8 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+import fitz
+
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 MODELS_DIR = DATA_DIR / "models"
@@ -13,6 +15,8 @@ UPLOADS_DIR = DATA_DIR / "uploads"
 ORDERS_DIR = DATA_DIR / "orders"
 OUTPUT_DIR = DATA_DIR / "output"
 MODELS_INDEX = DATA_DIR / "models.json"
+
+MM_PER_POINT = 25.4 / 72.0
 
 
 def ensure_dirs() -> None:
@@ -32,7 +36,41 @@ def save_models(models: list[dict[str, Any]]) -> None:
     MODELS_INDEX.write_text(json.dumps(models, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def inspect_cut_pdf(pdf_source: Path) -> dict[str, Any]:
+    """Valida o template e usa o tamanho físico do próprio PDF como autoridade."""
+    raw = pdf_source.read_bytes()
+    if b"CutContour" not in raw or b"Separation" not in raw:
+        raise ValueError(
+            "O PDF não contém a spot color CutContour como separação. "
+            "Exporte o arquivo de corte mantendo a cor especial CutContour."
+        )
+
+    doc = fitz.open(pdf_source)
+    try:
+        if doc.page_count != 1:
+            raise ValueError("O PDF base do corte deve ter exatamente uma página.")
+        page = doc[0]
+        width_mm = page.rect.width * MM_PER_POINT
+        height_mm = page.rect.height * MM_PER_POINT
+        if width_mm <= 0 or height_mm <= 0:
+            raise ValueError("O PDF base possui dimensões inválidas.")
+        return {
+            "width_mm": round(width_mm, 4),
+            "height_mm": round(height_mm, 4),
+            "has_cut_contour": True,
+        }
+    finally:
+        doc.close()
+
+
 def add_model(name: str, width_mm: float, height_mm: float, pdf_source: Path) -> dict[str, Any]:
+    """Cadastra um modelo.
+
+    width_mm/height_mm são mantidos na assinatura por compatibilidade com a interface
+    atual, porém o tamanho usado pelo nest é sempre lido do PDF para impedir que a
+    linha de corte seja escalada acidentalmente.
+    """
+    info = inspect_cut_pdf(pdf_source)
     models = load_models()
     model_id = uuid.uuid4().hex[:10]
     dest = MODELS_DIR / f"{model_id}.pdf"
@@ -40,11 +78,13 @@ def add_model(name: str, width_mm: float, height_mm: float, pdf_source: Path) ->
     model = {
         "id": model_id,
         "name": name,
-        "width_mm": float(width_mm),
-        "height_mm": float(height_mm),
+        "width_mm": info["width_mm"],
+        "height_mm": info["height_mm"],
         "pdf_path": str(dest.relative_to(BASE_DIR)),
         "spacing_mm": 2.0,
         "rotation_allowed": True,
+        "cut_contour": "CutContour",
+        "dimensions_source": "pdf_page",
     }
     models.append(model)
     save_models(models)
