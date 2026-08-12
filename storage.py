@@ -29,7 +29,6 @@ BUILTIN_PRESETS = [
 
 
 def inspect_cut_pdf(pdf_source: Path) -> dict[str, Any]:
-    """Valida o template e usa o tamanho físico do próprio PDF como autoridade."""
     raw = pdf_source.read_bytes()
     if b"CutContour" not in raw or b"Separation" not in raw:
         raise ValueError(
@@ -117,7 +116,6 @@ def save_models(models: list[dict[str, Any]]) -> None:
 
 
 def add_model(name: str, width_mm: float, height_mm: float, pdf_source: Path) -> dict[str, Any]:
-    """Cadastra um modelo adicional; dimensões são sempre lidas do PDF."""
     info = inspect_cut_pdf(pdf_source)
     models = load_models()
     model_id = uuid.uuid4().hex[:10]
@@ -182,3 +180,62 @@ def store_upload(source: Path, suffix: str) -> str:
     dest = UPLOADS_DIR / filename
     shutil.copy2(source, dest)
     return str(dest.relative_to(BASE_DIR))
+
+
+def _unlink_all(folder: Path, pattern: str = "*") -> int:
+    count = 0
+    if not folder.exists():
+        return count
+    for path in folder.glob(pattern):
+        if path.is_file():
+            path.unlink(missing_ok=True)
+            count += 1
+    return count
+
+
+def clear_history(completed_only: bool = False) -> dict[str, int]:
+    """Limpa testes/histórico sem tocar nos presets ou modelos cadastrados.
+
+    completed_only=True remove apenas pedidos já nested. O modo total remove todos
+    os pedidos, uploads de arte e PDFs gerados.
+    """
+    ensure_dirs()
+    removed_orders = 0
+    removed_uploads = 0
+
+    if completed_only:
+        referenced_uploads: set[Path] = set()
+        for path in ORDERS_DIR.glob("*.json"):
+            try:
+                order = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if order.get("status") == "nested":
+                image_rel = order.get("image_path")
+                if image_rel:
+                    referenced_uploads.add(BASE_DIR / image_rel)
+                path.unlink(missing_ok=True)
+                removed_orders += 1
+        # Só apaga a arte se não houver mais pedido referenciando-a.
+        remaining_refs = set()
+        for path in ORDERS_DIR.glob("*.json"):
+            try:
+                order = json.loads(path.read_text(encoding="utf-8"))
+                if order.get("image_path"):
+                    remaining_refs.add(BASE_DIR / order["image_path"])
+            except Exception:
+                pass
+        for p in referenced_uploads - remaining_refs:
+            if p.exists():
+                p.unlink(missing_ok=True)
+                removed_uploads += 1
+    else:
+        removed_orders = _unlink_all(ORDERS_DIR, "*.json")
+        removed_uploads = _unlink_all(UPLOADS_DIR)
+
+    removed_outputs = _unlink_all(OUTPUT_DIR)
+    return {
+        "orders": removed_orders,
+        "uploads": removed_uploads,
+        "outputs": removed_outputs,
+    }
