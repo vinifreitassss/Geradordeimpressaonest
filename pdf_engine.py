@@ -21,10 +21,14 @@ def mm(value: float) -> float:
 
 
 def render_pdf_preview(pdf_path: Path, zoom: float = 2.0) -> bytes:
+    """Renderiza somente o desenho do PDF sobre fundo transparente.
+
+    Assim o CutContour pode ficar visualmente por cima da arte no editor web.
+    """
     doc = fitz.open(pdf_path)
     try:
         page = doc[0]
-        pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
+        pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=True)
         return pix.tobytes("png")
     finally:
         doc.close()
@@ -55,11 +59,7 @@ def _piece_art_png(
     offset_y_mm: float,
     rotation: int = 0,
 ) -> bytes:
-    """Gera a arte raster já recortada na caixa da peça.
-
-    Isso mantém o bleed dentro do retângulo da peça e impede que zoom/deslocamento
-    invada a peça vizinha. O PDF de corte vetorial é sobreposto depois.
-    """
+    """Gera a arte raster já recortada na caixa da peça."""
     px_per_mm = ART_DPI / 25.4
     canvas_w = max(1, round(piece_w_mm * px_per_mm))
     canvas_h = max(1, round(piece_h_mm * px_per_mm))
@@ -125,6 +125,7 @@ def build_order_pdf(order: dict[str, Any], model: dict[str, Any], block: Any) ->
             rect = fitz.Rect(mm(x_mm), mm(y_mm), mm(x_mm + piece_w), mm(y_mm + piece_h))
 
             page.insert_image(rect, stream=art_png, keep_proportion=False)
+            # O PDF vetorial CutContour sempre entra por cima da arte.
             page.show_pdf_page(rect, template_doc, 0, keep_proportion=False, overlay=True)
 
         border = fitz.Rect(mm(0.25), mm(0.25), width_pt - mm(0.25), height_pt - mm(0.25))
