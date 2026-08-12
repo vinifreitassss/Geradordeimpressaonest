@@ -7,7 +7,7 @@ from typing import Any
 import barcode
 import fitz
 from barcode.writer import ImageWriter
-from PIL import Image, ImageChops, ImageDraw
+from PIL import Image, ImageChops
 
 from nest import LABEL_HEIGHT_MM, ORDER_PADDING_MM
 from storage import BASE_DIR, OUTPUT_DIR
@@ -21,7 +21,6 @@ def mm(value: float) -> float:
 
 
 def render_pdf_preview(pdf_path: Path, zoom: float = 2.0) -> bytes:
-    """Renderiza o CutContour sobre fundo transparente para o editor web."""
     doc = fitz.open(pdf_path)
     try:
         page = doc[0]
@@ -47,68 +46,43 @@ def _barcode_png(value: str) -> bytes:
     return stream.getvalue()
 
 
-def _sample_cubic(p0: fitz.Point, p1: fitz.Point, p2: fitz.Point, p3: fitz.Point, steps: int = 48) -> list[tuple[float, float]]:
-    points: list[tuple[float, float]] = []
-    for index in range(steps + 1):
-        t = index / steps
-        u = 1.0 - t
-        x = u**3 * p0.x + 3 * u * u * t * p1.x + 3 * u * t * t * p2.x + t**3 * p3.x
-        y = u**3 * p0.y + 3 * u * u * t * p1.y + 3 * u * t * t * p2.y + t**3 * p3.y
-        points.append((x, y))
-    return points
+def _cut_mask(template_path: Path, canvas_w: int, canvas_h: int) -> Image.Image:
+    """Cria máscara raster da área interna do CutContour.
 
-
-def _cut_contour_mask(template_path: Path, canvas_w: int, canvas_h: int) -> Image.Image:
-    """Cria uma máscara raster preenchida usando o próprio vetor CutContour.
-
-    A máscara não altera o PDF vetorial de corte: ela serve apenas para impedir que
-    a tinta da arte seja impressa fora da área demarcada pelo contorno.
+    Os presets atuais são contornos fechados simples. Renderizamos apenas o traço,
+    detectamos os pixels não transparentes e fazemos um flood-fill a partir das
+    bordas para distinguir exterior/interior. Assim a impressão fica somente
+    dentro da área demarcada, enquanto o CutContour vetorial original continua
+    sendo sobreposto depois para a Roland.
     """
     doc = fitz.open(template_path)
     try:
         page = doc[0]
-        drawings = page.get_drawings()
-        if not drawings:
-            raise ValueError(f"O modelo {template_path.name} não possui um contorno vetorial utilizável.")
+        sx = canvas_w / page.rect.width
+        sy = canvas_h / page.rect.height
+        pix = page.get_pixmap(matrix=fitz.Matrix(sx, sy), alpha=True)
+        rgba = Image.frombytes("RGBA", (pix.width, pix.height), pix.samples)
+        alpha = rgba.getchannel("A")
+        if rgba.size != (canvas_w, canvas_h):
+            alpha = alpha.resize((canvas_w, canvas_h), Image.Resampling.LANCZOS)
 
-        # Nos presets Roland o CutContour é o desenho principal. Usamos o maior
-        # contorno para ignorar eventuais pequenos objetos auxiliares no futuro.
-        outline = max(drawings, key=lambda drawing: drawing["rect"].width * drawing["rect"].height)
-        points: list[tuple[float, float]] = []
+        # torna o traço um pouco mais robusto para fechar possíveis anti-alias gaps
+        line = alpha.point(lambda p: 255 if p > 12 else 0)
+        line = line.filter(__import__("PIL").ImageFilter.MaxFilter(5))
 
-        for item in outline["items"]:
-            op = item[0]
-            if op == "l":
-                p0, p1 = item[1], item[2]
-                if not points:
-                    points.append((p0.x, p0.y))
-                points.append((p1.x, p1.y))
-            elif op == "c":
-                p0, p1, p2, p3 = item[1], item[2], item[3], item[4]
-                sampled = _sample_cubic(p0, p1, p2, p3)
-                if points:
-                    sampled = sampled[1:]
-                points.extend(sampled)
-            elif op == "re":
-                rect = item[1]
-                points.extend(
-                    [
-                        (rect.x0, rect.y0),
-                        (rect.x1, rect.y0),
-                        (rect.x1, rect.y1),
-                        (rect.x0, rect.y1),
-                    ]
-                )
-
-        if len(points) < 3:
-            raise ValueError(f"Não foi possível reconstruir a área interna do CutContour de {template_path.name}.")
-
-        scale_x = canvas_w / page.rect.width
-        scale_y = canvas_h / page.rect.height
-        polygon = [(round(x * scale_x), round(y * scale_y)) for x, y in points]
-
-        mask = Image.new("L", (canvas_w, canvas_h), 0)
-        ImageDraw.Draw(mask).polygon(polygon, fill=255)
+        # Flood-fill do exterior em uma imagem onde o traço é barreira.
+        # Pillow floodfill trabalha em L; começamos tudo preto, barreira branca,
+        # e marcamos o exterior com 128.
+        work = line.copy()
+        from PIL import ImageDraw
+        # Preenche a partir dos quatro cantos; os pixels de linha (255) bloqueiam.
+        for seed in [(0, 0), (canvas_w - 1, 0), (0, canvas_h - 1), (canvas_w - 1, canvas_h - 1)]:
+            try:
+                ImageDraw.floodfill(work, seed, 128, thresh=0)
+            except Exception:
+                pass
+        # interior = pixels ainda pretos; linha também entra na máscara.
+        mask = work.point(lambda p: 0 if p == 128 else 255)
         return mask
     finally:
         doc.close()
@@ -124,7 +98,6 @@ def _piece_art_png(
     offset_y_mm: float,
     rotation: int = 0,
 ) -> bytes:
-    """Monta a arte e elimina tudo que estiver fora do CutContour."""
     px_per_mm = ART_DPI / 25.4
     canvas_w = max(1, round(piece_w_mm * px_per_mm))
     canvas_h = max(1, round(piece_h_mm * px_per_mm))
@@ -147,10 +120,9 @@ def _piece_art_png(
         y = (canvas_h - art.height) // 2 + oy
         canvas.alpha_composite(art, (x, y))
 
-        # A tinta só permanece na região interna delimitada pelo CutContour.
-        cut_mask = _cut_contour_mask(template_path, canvas_w, canvas_h)
-        alpha = canvas.getchannel("A")
-        canvas.putalpha(ImageChops.multiply(alpha, cut_mask))
+        mask = _cut_mask(template_path, canvas_w, canvas_h)
+        current_alpha = canvas.getchannel("A")
+        canvas.putalpha(ImageChops.multiply(current_alpha, mask))
 
         stream = io.BytesIO()
         canvas.save(stream, format="PNG", dpi=(ART_DPI, ART_DPI))
@@ -158,8 +130,9 @@ def _piece_art_png(
 
 
 def build_order_pdf(order: dict[str, Any], model: dict[str, Any], block: Any) -> Path:
+    """Gera um PDF intermediário para um bloco (ou fragmento) de pedido."""
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    out = OUTPUT_DIR / f"pedido_{order['code']}_{order['id']}.pdf"
+    out = OUTPUT_DIR / f"bloco_{block.block_id}.pdf"
 
     width_pt = mm(block.width_mm)
     height_pt = mm(block.height_mm)
@@ -196,17 +169,19 @@ def build_order_pdf(order: dict[str, Any], model: dict[str, Any], block: Any) ->
             rect = fitz.Rect(mm(x_mm), mm(y_mm), mm(x_mm + piece_w), mm(y_mm + piece_h))
 
             page.insert_image(rect, stream=art_png, keep_proportion=False)
-            # O PDF vetorial CutContour entra por cima e continua sendo a linha real de corte.
             page.show_pdf_page(rect, template_doc, 0, keep_proportion=False, overlay=True)
 
         border = fitz.Rect(mm(0.25), mm(0.25), width_pt - mm(0.25), height_pt - mm(0.25))
         page.draw_rect(border, width=0.25)
 
-        info = f"PED {order['code']} | {model['name']} | QTD {order['quantity']}"
+        part = ""
+        if getattr(block, "part_total", 1) > 1:
+            part = f" | PARTE {block.part_index}/{block.part_total}"
+        info = f"PED {order['code']} | {model['name']} | QTD BLOCO {block.quantity}/{order['quantity']}{part}"
         details = (order.get("details") or "").strip()
         if details:
             info += f" | {details}"
-        page.insert_text((mm(pad), mm(4.0)), info[:140], fontsize=5.5)
+        page.insert_text((mm(pad), mm(4.0)), info[:160], fontsize=5.3)
 
         barcode_bytes = _barcode_png(str(order["code"]))
         barcode_rect = fitz.Rect(width_pt - mm(38), mm(1.0), width_pt - mm(2), mm(8.2))
@@ -220,16 +195,12 @@ def build_order_pdf(order: dict[str, Any], model: dict[str, Any], block: Any) ->
     return out
 
 
-def compose_sheet_pdf(sheet: dict[str, Any], order_pdf_paths: dict[str, Path], output_name: str) -> Path:
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    out = OUTPUT_DIR / output_name
-    doc = fitz.open()
+def _append_sheet_page(doc: fitz.Document, sheet: dict[str, Any], block_pdf_paths: dict[str, Path]) -> None:
     page = doc.new_page(width=mm(sheet["width_mm"]), height=mm(sheet["height_mm"]))
-
     opened: list[fitz.Document] = []
     try:
         for item in sheet["items"]:
-            src = fitz.open(order_pdf_paths[item["order_id"]])
+            src = fitz.open(block_pdf_paths[item["block_id"]])
             opened.append(src)
             target = fitz.Rect(
                 mm(item["x_mm"]),
@@ -237,11 +208,27 @@ def compose_sheet_pdf(sheet: dict[str, Any], order_pdf_paths: dict[str, Path], o
                 mm(item["x_mm"] + item["width_mm"]),
                 mm(item["y_mm"] + item["height_mm"]),
             )
-            rotate = 90 if item["rotated"] else 0
-            page.show_pdf_page(target, src, 0, rotate=rotate, keep_proportion=False, overlay=True)
-        doc.save(out, garbage=4, deflate=True)
+            # O bloco externo nunca gira: 450 mm é a largura fixa da máquina.
+            page.show_pdf_page(target, src, 0, rotate=0, keep_proportion=False, overlay=True)
     finally:
         for src in opened:
             src.close()
+
+
+def compose_batch_pdf(sheets: list[dict[str, Any]], block_pdf_paths: dict[str, Path], output_name: str) -> Path:
+    """Gera UM ÚNICO PDF, com uma página para cada folha de impressão."""
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    out = OUTPUT_DIR / output_name
+    doc = fitz.open()
+    try:
+        for sheet in sheets:
+            _append_sheet_page(doc, sheet, block_pdf_paths)
+        doc.save(out, garbage=4, deflate=True)
+    finally:
         doc.close()
     return out
+
+
+def compose_sheet_pdf(sheet: dict[str, Any], block_pdf_paths: dict[str, Path], output_name: str) -> Path:
+    """Mantido por compatibilidade; gera somente uma página."""
+    return compose_batch_pdf([sheet], block_pdf_paths, output_name)
