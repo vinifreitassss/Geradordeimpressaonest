@@ -7,7 +7,7 @@ from typing import Any
 import barcode
 import fitz
 from barcode.writer import ImageWriter
-from PIL import Image, ImageChops
+from PIL import Image, ImageChops, ImageFilter, ImageDraw
 
 from nest import LABEL_HEIGHT_MM, ORDER_PADDING_MM
 from storage import BASE_DIR, OUTPUT_DIR
@@ -47,14 +47,6 @@ def _barcode_png(value: str) -> bytes:
 
 
 def _cut_mask(template_path: Path, canvas_w: int, canvas_h: int) -> Image.Image:
-    """Cria máscara raster da área interna do CutContour.
-
-    Os presets atuais são contornos fechados simples. Renderizamos apenas o traço,
-    detectamos os pixels não transparentes e fazemos um flood-fill a partir das
-    bordas para distinguir exterior/interior. Assim a impressão fica somente
-    dentro da área demarcada, enquanto o CutContour vetorial original continua
-    sendo sobreposto depois para a Roland.
-    """
     doc = fitz.open(template_path)
     try:
         page = doc[0]
@@ -66,24 +58,15 @@ def _cut_mask(template_path: Path, canvas_w: int, canvas_h: int) -> Image.Image:
         if rgba.size != (canvas_w, canvas_h):
             alpha = alpha.resize((canvas_w, canvas_h), Image.Resampling.LANCZOS)
 
-        # torna o traço um pouco mais robusto para fechar possíveis anti-alias gaps
         line = alpha.point(lambda p: 255 if p > 12 else 0)
-        line = line.filter(__import__("PIL").ImageFilter.MaxFilter(5))
-
-        # Flood-fill do exterior em uma imagem onde o traço é barreira.
-        # Pillow floodfill trabalha em L; começamos tudo preto, barreira branca,
-        # e marcamos o exterior com 128.
+        line = line.filter(ImageFilter.MaxFilter(5))
         work = line.copy()
-        from PIL import ImageDraw
-        # Preenche a partir dos quatro cantos; os pixels de linha (255) bloqueiam.
         for seed in [(0, 0), (canvas_w - 1, 0), (0, canvas_h - 1), (canvas_w - 1, canvas_h - 1)]:
             try:
                 ImageDraw.floodfill(work, seed, 128, thresh=0)
             except Exception:
                 pass
-        # interior = pixels ainda pretos; linha também entra na máscara.
-        mask = work.point(lambda p: 0 if p == 128 else 255)
-        return mask
+        return work.point(lambda p: 0 if p == 128 else 255)
     finally:
         doc.close()
 
@@ -130,7 +113,6 @@ def _piece_art_png(
 
 
 def build_order_pdf(order: dict[str, Any], model: dict[str, Any], block: Any) -> Path:
-    """Gera um PDF intermediário para um bloco (ou fragmento) de pedido."""
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     out = OUTPUT_DIR / f"bloco_{block.block_id}.pdf"
 
@@ -167,7 +149,6 @@ def build_order_pdf(order: dict[str, Any], model: dict[str, Any], block: Any) ->
             x_mm = pad + col * (piece_w + spacing)
             y_mm = grid_top_mm + row * (piece_h + spacing)
             rect = fitz.Rect(mm(x_mm), mm(y_mm), mm(x_mm + piece_w), mm(y_mm + piece_h))
-
             page.insert_image(rect, stream=art_png, keep_proportion=False)
             page.show_pdf_page(rect, template_doc, 0, keep_proportion=False, overlay=True)
 
@@ -208,7 +189,6 @@ def _append_sheet_page(doc: fitz.Document, sheet: dict[str, Any], block_pdf_path
                 mm(item["x_mm"] + item["width_mm"]),
                 mm(item["y_mm"] + item["height_mm"]),
             )
-            # O bloco externo nunca gira: 450 mm é a largura fixa da máquina.
             page.show_pdf_page(target, src, 0, rotate=0, keep_proportion=False, overlay=True)
     finally:
         for src in opened:
@@ -216,7 +196,6 @@ def _append_sheet_page(doc: fitz.Document, sheet: dict[str, Any], block_pdf_path
 
 
 def compose_batch_pdf(sheets: list[dict[str, Any]], block_pdf_paths: dict[str, Path], output_name: str) -> Path:
-    """Gera UM ÚNICO PDF, com uma página para cada folha de impressão."""
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     out = OUTPUT_DIR / output_name
     doc = fitz.open()
@@ -230,5 +209,4 @@ def compose_batch_pdf(sheets: list[dict[str, Any]], block_pdf_paths: dict[str, P
 
 
 def compose_sheet_pdf(sheet: dict[str, Any], block_pdf_paths: dict[str, Path], output_name: str) -> Path:
-    """Mantido por compatibilidade; gera somente uma página."""
     return compose_batch_pdf([sheet], block_pdf_paths, output_name)
