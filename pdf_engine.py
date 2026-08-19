@@ -10,7 +10,6 @@ from barcode.writer import ImageWriter
 from PIL import Image, ImageChops, ImageFilter, ImageDraw
 
 from nest import LABEL_HEIGHT_MM, ORDER_PADDING_MM
-from storage import BASE_DIR, OUTPUT_DIR
 
 MM_TO_PT = 72.0 / 25.4
 ART_DPI = 300
@@ -112,9 +111,15 @@ def _piece_art_png(
         return stream.getvalue()
 
 
-def build_order_pdf(order: dict[str, Any], model: dict[str, Any], block: Any) -> Path:
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    out = OUTPUT_DIR / f"bloco_{block.block_id}.pdf"
+def build_order_pdf(
+    order: dict[str, Any],
+    model: dict[str, Any],
+    block: Any,
+    base_dir: Path,
+    output_dir: Path,
+) -> Path:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    out = output_dir / f"bloco_{block.block_id}.pdf"
 
     width_pt = mm(block.width_mm)
     height_pt = mm(block.height_mm)
@@ -127,8 +132,8 @@ def build_order_pdf(order: dict[str, Any], model: dict[str, Any], block: Any) ->
     piece_h = block.piece_height_mm
     spacing = 2.0
 
-    image_path = BASE_DIR / order["image_path"]
-    template_path = BASE_DIR / model["pdf_path"]
+    image_path = base_dir / order["image_path"]
+    template_path = base_dir / model["pdf_path"]
     template_doc = fitz.open(template_path)
 
     art_png = _piece_art_png(
@@ -195,9 +200,14 @@ def _append_sheet_page(doc: fitz.Document, sheet: dict[str, Any], block_pdf_path
             src.close()
 
 
-def compose_batch_pdf(sheets: list[dict[str, Any]], block_pdf_paths: dict[str, Path], output_name: str) -> Path:
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    out = OUTPUT_DIR / output_name
+def compose_batch_pdf(
+    sheets: list[dict[str, Any]],
+    block_pdf_paths: dict[str, Path],
+    output_name: str,
+    output_dir: Path,
+) -> Path:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    out = output_dir / output_name
     doc = fitz.open()
     try:
         for sheet in sheets:
@@ -208,5 +218,10 @@ def compose_batch_pdf(sheets: list[dict[str, Any]], block_pdf_paths: dict[str, P
     return out
 
 
-def compose_sheet_pdf(sheet: dict[str, Any], block_pdf_paths: dict[str, Path], output_name: str) -> Path:
-    return compose_batch_pdf([sheet], block_pdf_paths, output_name)
+def compose_sheet_pdf(
+    sheet: dict[str, Any],
+    block_pdf_paths: dict[str, Path],
+    output_name: str,
+    output_dir: Path,
+) -> Path:
+    return compose_batch_pdf([sheet], block_pdf_paths, output_name, output_dir)
