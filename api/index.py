@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 import shutil
 import tempfile
@@ -8,7 +9,7 @@ from datetime import datetime
 from pathlib import Path
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import Response
+from fastapi.responses import StreamingResponse
 
 from nest import pack_order_blocks, split_order_blocks
 from pdf_engine import build_order_pdf, compose_batch_pdf
@@ -223,4 +224,8 @@ async def generate(
             "X-Pages": str(len(sheets)),
             "X-Warnings": json.dumps(errors, ensure_ascii=True),
         }
-        return Response(content=pdf_bytes, media_type="application/pdf", headers=headers)
+        return StreamingResponse(
+            io.BytesIO(pdf_bytes),
+            media_type="application/pdf",
+            headers=headers,
+        )
