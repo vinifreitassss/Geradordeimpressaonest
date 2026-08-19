@@ -101,8 +101,6 @@ async def generate(
             key = Path(upload.filename or "").stem
             custom_files_by_key[key] = upload
 
-        # Custom model files are identified by the browser-generated key in the filename.
-        # The original filename is retained only for extension validation.
         for model in model_data:
             key = str(model.get("key", ""))
             name = str(model.get("name", "")).strip()
@@ -220,24 +218,9 @@ async def generate(
         final_pdf = compose_batch_pdf(sheets, block_pdf_paths, filename, output_dir)
         pdf_bytes = final_pdf.read_bytes()
 
-        sheet_info = []
-        for sheet in sheets:
-            codes = []
-            for item in sheet["items"]:
-                code = order_by_id[item["order_id"]]["code"]
-                if code not in codes:
-                    codes.append(code)
-            sheet_info.append({
-                "page": sheet["index"],
-                "width_mm": sheet["width_mm"],
-                "height_mm": round(sheet["height_mm"], 2),
-                "utilization": round(sheet["utilization"] * 100, 1),
-                "orders": codes,
-            })
-
         headers = {
             "Content-Disposition": f'attachment; filename="{filename}"',
             "X-Pages": str(len(sheets)),
-            "X-Warnings": json.dumps(errors, ensure_ascii=False),
+            "X-Warnings": json.dumps(errors, ensure_ascii=True),
         }
         return Response(content=pdf_bytes, media_type="application/pdf", headers=headers)
